@@ -16,8 +16,9 @@ import numpy as np
 import json
 import datasets
 #import evaluate
-import torch.nn.functional as F
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from datasets import load_dataset
 import transformers
 print(transformers.__version__)
@@ -26,35 +27,33 @@ from transformers import (
     MODEL_FOR_CAUSAL_LM_MAPPING,
     AutoConfig,
     AutoModelForCausalLM,
-    AutoTokenizer,
     AutoModelForMaskedLM,
+    AutoTokenizer,
     HfArgumentParser,
-    # Trainer,
     TrainingArguments,
     default_data_collator,
     is_torch_tpu_available,
     set_seed,
 )
+from transformers import DataCollatorForLanguageModeling
 from my_trainer import Trainer
 from transformers import TrainerCallback
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import send_example_telemetry
 from transformers.utils.versions import require_version
-from transformers import DataCollatorForLanguageModeling
-# xxx: 2023-03-21
-import copy
-import torch.nn as nn
-import torch.nn.functional as F
+
 import time
+import copy
+import editdistance
 
 def timer(func):
     def wrapper(*args, **kwargs):
-        start_time = time.time()  # Record the start time
-        result = func(*args, **kwargs)  # Call the original function
-        end_time = time.time()  # Record the end time
-        execution_time = end_time - start_time  # Calculate the execution time
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        end_time = time.time()
+        execution_time = end_time - start_time
         print(f"Function '{func.__name__}' executed in {execution_time:.4f} seconds")
-        return result  # Return the result of the original function
+        return result
     return wrapper
 
 if is_sagemaker_mp_enabled():
@@ -62,7 +61,6 @@ if is_sagemaker_mp_enabled():
     from smdistributed.modelparallel import __version__ as SMP_VERSION
     from transformers.trainer_pt_utils import smp_forward_backward, smp_forward_only, smp_gather, smp_nested_concat
 
-import editdistance
 TOKENIZER_TO_SPECIAL_TOKEN = {
     transformers.LlamaTokenizer: "▁",
     transformers.LlamaTokenizerFast: "▁",
@@ -75,16 +73,10 @@ TOKENIZER_TO_SPECIAL_TOKEN = {
     transformers.BertTokenizerFast: "##",
 }
 
-# require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/language-modeling/requirements.txt")
-
 logger = logging.getLogger(__name__)
-
-
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_CAUSAL_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
-
-# xxx: 2023-03-21
 IGNORE_INDEX = -100
 DEFAULT_PAD_TOKEN = "[PAD]"
 DEFAULT_EOS_TOKEN = "</s>"
@@ -98,97 +90,39 @@ def calculate_weight(logits):
     entropy = -torch.sum(probabilities * torch.log(probabilities), dim=-1)
     entropy_min = entropy.min()
     entropy_max = entropy.max()
-    factor = torch.sigmoid((entropy - entropy_min)/(entropy_max-entropy_min) * 4 - 2) # [0,1]\
+    factor = torch.sigmoid((entropy - entropy_min) / (entropy_max - entropy_min) * 4 - 2)
     factor = torch.tensor((factor * 3 + 3), dtype=torch.int32).detach().cpu().tolist()
-
     return factor
-
 
 @dataclass
 class ModelArguments:
-    """
-    Arguments pertaining to which model/config/tokenizer we are going to fine-tune, or train from scratch.
-    """
-
     model_name_or_path: Optional[str] = field(
         default=None,
-        metadata={
-            "help": (
-                "The model checkpoint for weights initialization.Don't set if you want to train a model from scratch."
-            )
-        },
+        metadata={"help": "Student model checkpoint."},
     )
-    teacher_path: Optional[str] = field(
-        default=None
-    )
+    teacher_path: Optional[str] = field(default=None, metadata={"help": "Comma-separated teacher path(s)."})
     model_type: Optional[str] = field(
         default=None,
-        metadata={"help": "If training from scratch, pass a model type from the list: " + ", ".join(MODEL_TYPES)},
+        metadata={"help": "If training from scratch, pass a model type from: " + ", ".join(MODEL_TYPES)},
     )
-    config_overrides: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": (
-                "Override some existing default config settings when a model is trained from scratch. Example: "
-                "n_embd=10,resid_pdrop=0.2,scale_attn_weights=false,summary_type=cls_index"
-            )
-        },
-    )
-    config_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
-    )
-    tokenizer_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
-    )
-    cache_dir: Optional[str] = field(
-        default=None,
-        metadata={"help": "Where do you want to store the pretrained models downloaded from huggingface.co"},
-    )
-    use_fast_tokenizer: bool = field(
-        default=True,
-        metadata={"help": "Whether to use one of the fast tokenizer (backed by the tokenizers library) or not."},
-    )
-    model_revision: str = field(
-        default="main",
-        metadata={"help": "The specific model version to use (can be a branch name, tag name or commit id)."},
-    )
-    use_auth_token: bool = field(
-        default=False,
-        metadata={
-            "help": (
-                "Will use the token generated when running `huggingface-cli login` (necessary to use this script "
-                "with private models)."
-            )
-        },
-    )
+    config_overrides: Optional[str] = field(default=None)
+    config_name: Optional[str] = field(default=None)
+    tokenizer_name: Optional[str] = field(default=None)
+    cache_dir: Optional[str] = field(default=None)
+    use_fast_tokenizer: bool = field(default=True)
+    model_revision: str = field(default="main")
+    use_auth_token: bool = field(default=False)
     torch_dtype: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": (
-                "Override the default `torch.dtype` and load the model under this dtype. If `auto` is passed, the "
-                "dtype will be automatically derived from the model's weights."
-            ),
-            "choices": ["auto", "bfloat16", "float16", "float32"],
-        },
+        default=None, metadata={"choices": ["auto", "bfloat16", "float16", "float32"]}
     )
 
-    freeze_emb: bool = field(
-        default=False,
-        metadata={"help": "whether freeze the weights of emb"},
-    )
+    freeze_emb: bool = field(default=False)
+    freeze_layers: Optional[str] = field(default=None)
 
-    freeze_layers: Optional[str] = field(
-        default=None,
-        metadata={"help": "whether freeze the weights of some layers"},
-    )
+    kd_alpha: Optional[float] = field(default=0.9)
+    kd_temperature: Optional[float] = field(default=0.8)
 
-    kd_alpha: Optional[float] = field(
-        default=0.9
-    )
-    kd_temperature: Optional[float] = field(
-        default=0.8
-    )
-    # --- NEW: hỗ trợ student là encoder (MaskedLM/BERT)
+    # NEW: hỗ trợ student là encoder (MaskedLM/BERT)
     student_arch: Optional[str] = field(
         default="masked_lm",
         metadata={"help": "Student architecture: 'masked_lm' (BERT) hoặc 'causal_lm'."},
@@ -197,102 +131,38 @@ class ModelArguments:
         default=0.15,
         metadata={"help": "Tỷ lệ mask khi student_arch == 'masked_lm'."},
     )
-    enable_edit_kd: Optional[bool] = field(
-        default=False,
-    )
-    enable_topk: Optional[bool] = field(
-        default=False,
-    )
-    topk: Optional[int] = field(
-        default=100,
-    )
-    simi_threadshold: Optional[float] = field(
-        default=0.3,
-    )
-    teacher_to_student_id_mapping: Optional[str] = field(
-        default=None
-    )
+
+    enable_edit_kd: Optional[bool] = field(default=False)
+    enable_topk: Optional[bool] = field(default=False)
+    topk: Optional[int] = field(default=100)
+    simi_threadshold: Optional[float] = field(default=0.3)
+    teacher_to_student_id_mapping: Optional[str] = field(default=None)
 
     def __post_init__(self):
         if self.config_overrides is not None and (self.config_name is not None or self.model_name_or_path is not None):
-            raise ValueError(
-                "--config_overrides can't be used in combination with --config_name or --model_name_or_path"
-            )
+            raise ValueError("--config_overrides can't be used with --config_name or --model_name_or_path")
 
 
 @dataclass
 class DataTrainingArguments:
-    """
-    Arguments pertaining to what data we are going to input our model for training and eval.
-    """
-
-    dataset_name: Optional[str] = field(
-        default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
-    )
-    dataset_config_name: Optional[str] = field(
-        default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
-    )
-    train_file: Optional[str] = field(default=None, metadata={"help": "The input training data file (a text file)."})
-    validation_file: Optional[str] = field(
-        default=None,
-        metadata={"help": "An optional input evaluation data file to evaluate the perplexity on (a text file)."},
-    )
-    max_train_samples: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": (
-                "For debugging purposes or quicker training, truncate the number of training examples to this "
-                "value if set."
-            )
-        },
-    )
-    max_eval_samples: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": (
-                "For debugging purposes or quicker training, truncate the number of evaluation examples to this "
-                "value if set."
-            )
-        },
-    )
-    streaming: bool = field(default=False, metadata={"help": "Enable streaming mode"})
-    shuffle_buffer_size: int = field(default=10000, metadata={"help": "Enable streaming mode"})
-
-    block_size: Optional[int] = field(
-        default=None,
-        metadata={
-            "help": (
-                "Optional input sequence length after tokenization. "
-                "The training dataset will be truncated in block of this size for training. "
-                "Default to the model max input length for single sentence inputs (take into account special tokens)."
-            )
-        },
-    )
-    overwrite_cache: bool = field(
-        default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
-    )
-    validation_split_percentage: Optional[int] = field(
-        default=5,
-        metadata={
-            "help": "The percentage of the train set used as validation set in case there's no validation split"
-        },
-    )
-    preprocessing_num_workers: Optional[int] = field(
-        default=None,
-        metadata={"help": "The number of processes to use for the preprocessing."},
-    )
-    keep_linebreaks: bool = field(
-        default=True, metadata={"help": "Whether to keep line breaks when using TXT files or not."}
-    )
-
-    padding_side: str = field(
-        default=None, metadata={"help": "padding_side"}
-    )
+    dataset_name: Optional[str] = field(default=None)
+    dataset_config_name: Optional[str] = field(default=None)
+    train_file: Optional[str] = field(default=None)
+    validation_file: Optional[str] = field(default=None)
+    max_train_samples: Optional[int] = field(default=None)
+    max_eval_samples: Optional[int] = field(default=None)
+    streaming: bool = field(default=False)
+    shuffle_buffer_size: int = field(default=10000)
+    block_size: Optional[int] = field(default=None)
+    overwrite_cache: bool = field(default=False)
+    validation_split_percentage: Optional[int] = field(default=5)
+    preprocessing_num_workers: Optional[int] = field(default=None)
+    keep_linebreaks: bool = field(default=True)
+    padding_side: str = field(default=None)
 
     def __post_init__(self):
         if self.streaming:
             require_version("datasets>=2.0.0", "The streaming feature requires `datasets>=2.0.0`")
-
         if self.dataset_name is None and self.train_file is None and self.validation_file is None:
             raise ValueError("Need either a dataset name or a training/validation file.")
         else:
@@ -304,28 +174,77 @@ class DataTrainingArguments:
                 assert extension in ["csv", "json", "txt"], "`validation_file` should be a csv, a json or a txt file."
 
 
-def main():
-    # See all possible arguments in src/transformers/training_args.py
-    # or by passing the --help flag to this script.
-    # We now keep distinct sets of args, for a cleaner separation of concerns.
+# --------- Collator kết hợp cho CDM + MLM ----------
+class CDMMLMCollator:
+    """
+    - Pad student bằng student tokenizer.
+    - Tạo MLM labels cho student.
+    - Pad toàn bộ teacher_* bằng teacher tokenizer.
+    - Giữ teacher_labels0 và pad bằng IGNORE_INDEX.
+    """
+    def __init__(self, student_tokenizer, teacher_tokenizer, mlm_probability=0.15):
+        self.stu_tok = student_tokenizer
+        self.tea_tok = teacher_tokenizer
+        if self.tea_tok.pad_token is None and self.tea_tok.eos_token is not None:
+            self.tea_tok.pad_token = self.tea_tok.eos_token
+        self.mlm = DataCollatorForLanguageModeling(
+            tokenizer=student_tokenizer, mlm=True, mlm_probability=mlm_probability
+        )
 
+    def __call__(self, features):
+        # Lưu teacher_* ra riêng
+        tea_feats = []
+        tea_labels_list = []
+        for f in features:
+            tea_feats.append({
+                "input_ids": f["teacher_input_ids0"],
+                "attention_mask": f["teacher_attention_mask0"],
+            })
+            if "teacher_labels0" in f:
+                tea_labels_list.append(torch.tensor(f["teacher_labels0"], dtype=torch.long))
+
+        # Tạo batch student (pad + MLM labels)
+        # tokenizer.pad sẽ chỉ pad các khóa model_input_names; khóa khác trả về riêng
+        stu_pad_batch = self.stu_tok.pad(features, padding=True, return_tensors="pt")
+
+        # Chuẩn bị input cho MLM collator (chỉ giữ các khóa student)
+        mlm_input = []
+        keep_keys = {"input_ids", "attention_mask", "token_type_ids"}
+        for f in features:
+            mlm_input.append({k: v for k, v in f.items() if k in keep_keys})
+
+        mlm_batch = self.mlm(mlm_input)
+        stu_pad_batch["input_ids"] = mlm_batch["input_ids"]
+        stu_pad_batch["attention_mask"] = mlm_batch["attention_mask"]
+        stu_pad_batch["labels"] = mlm_batch["labels"]
+        if "token_type_ids" in mlm_batch:
+            stu_pad_batch["token_type_ids"] = mlm_batch["token_type_ids"]
+
+        # Pad teacher side
+        tea_batch = self.tea_tok.pad(tea_feats, padding=True, return_tensors="pt")
+        stu_pad_batch["teacher_input_ids0"] = tea_batch["input_ids"]
+        stu_pad_batch["teacher_attention_mask0"] = tea_batch["attention_mask"]
+
+        if len(tea_labels_list) > 0:
+            tea_labels = torch.nn.utils.rnn.pad_sequence(
+                tea_labels_list, batch_first=True, padding_value=IGNORE_INDEX
+            )
+            stu_pad_batch["teacher_labels0"] = tea_labels
+
+        return stu_pad_batch
+# ---------------------------------------------------
+
+
+def main():
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
-        # If we pass only one argument to the script and it's the path to a json file,
-        # let's parse it to get our arguments.
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    
     training_args.disable_tqdm = True
-
-
-    # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
-    # information sent is the one passed as arguments along with your Python/PyTorch versions.
     send_example_telemetry("run_clm", model_args, data_args)
 
-    # Setup logging
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
@@ -333,7 +252,6 @@ def main():
     )
 
     if training_args.should_log:
-        # The default of training_args.log_level is passive, so we set log level at info here to have that default.
         transformers.utils.logging.set_verbosity_info()
 
     log_level = training_args.get_process_log_level()
@@ -343,10 +261,9 @@ def main():
     transformers.utils.logging.enable_default_handler()
     transformers.utils.logging.enable_explicit_format()
 
-    # Log on each process the small summary:
     logger.warning(
         f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
-        + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
+        + f" distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
     )
     logger.info(f"Training/evaluation parameters {training_args}")
 
@@ -360,9 +277,9 @@ def main():
         def update(self, sft_loss, distill_loss, unmasked_rate=None, n=1):
             if math.isnan(sft_loss) or math.isinf(sft_loss) or math.isnan(distill_loss) or math.isinf(distill_loss):
                 print("Skipping update due to NaN or Inf value.")
-                self.count += 1 
+                self.count += 1
                 return
-            if n%100==0:
+            if n % 100 == 0:
                 self.sft_loss = 0
                 self.distill_loss = 0
                 self.unmasked_rate = 0
@@ -373,13 +290,12 @@ def main():
             self.count += n
 
         def compute(self):
-            if self.count==0:
+            if self.count == 0:
                 return 0, 0
             if model_args.enable_edit_kd:
-                return self.sft_loss/self.count, self.distill_loss/self.count, self.unmasked_rate/self.count
+                return self.sft_loss / self.count, self.distill_loss / self.count, self.unmasked_rate / self.count
             else:
-                return self.sft_loss/self.count, self.distill_loss/self.count
-        
+                return self.sft_loss / self.count, self.distill_loss / self.count
 
     class DistillationTrainer(Trainer):
         def __init__(self, *args, teacher_models=None, tokenizers=None, **kwargs):
@@ -391,11 +307,9 @@ def main():
             self.distill_metrics = CustomMetric()
             if model_args.teacher_to_student_id_mapping is not None:
                 self.tea2stu_id_mapping = json.load(open(model_args.teacher_to_student_id_mapping))
-                
-                self.stu2tea_id_mapping = torch.zeros(self.student_tokenizer.vocab_size+256, dtype=torch.long)
+                self.stu2tea_id_mapping = torch.zeros(self.student_tokenizer.vocab_size + 256, dtype=torch.long)
                 for tea_id in self.tea2stu_id_mapping:
-
-                    if self.tea2stu_id_mapping[tea_id]!=0:
+                    if self.tea2stu_id_mapping[tea_id] != 0:
                         self.stu2tea_id_mapping[self.tea2stu_id_mapping[tea_id]] = int(tea_id)
 
                 self.tea2stu_id_mapping = list(self.tea2stu_id_mapping.values())
@@ -410,62 +324,56 @@ def main():
                 self.em_stu2tea_id_mapping = copy.deepcopy(self.stu2tea_id_mapping)
 
             for teacher in self.teachers:
-                # place each teacher on same device as student
                 teacher = teacher.half().eval()
                 self._move_model_to_device(teacher, training_args.device)
-                        
-
 
         def compute_loss(self, model, inputs, return_outputs=False):
-            outputs_student = model(input_ids=inputs['input_ids'], attention_mask=inputs['attention_mask'], labels=inputs['labels'], output_hidden_states=True, output_attentions=True)
+            outputs_student = model(
+                input_ids=inputs['input_ids'],
+                attention_mask=inputs['attention_mask'],
+                labels=inputs['labels'],
+                output_hidden_states=True,
+                output_attentions=True
+            )
             student_loss = outputs_student.loss
-            
-            
-            # compute teacher output
+
             with torch.no_grad():
-                outputs_teacher = self.teachers[0](input_ids=inputs['teacher_input_ids0'], attention_mask=inputs['teacher_attention_mask0'], output_hidden_states=True, output_attentions=True)
-            
-            kd_loss = 0
+                outputs_teacher = self.teachers[0](
+                    input_ids=inputs['teacher_input_ids0'],
+                    attention_mask=inputs['teacher_attention_mask0'],
+                    output_hidden_states=True,
+                    output_attentions=True
+                )
+
             edit_kd_loss, unmasked_rate = self.compute_edit_distance_kd_loss(outputs_student, outputs_teacher, inputs)
             kd_loss = edit_kd_loss
-            
-            self.distill_metrics.update(sft_loss=student_loss.item(), distill_loss=(kd_loss).item(), unmasked_rate=unmasked_rate)
-            loss = model_args.kd_alpha * student_loss + (1.0 - model_args.kd_alpha) * (kd_loss)
-         
+            self.distill_metrics.update(
+                sft_loss=student_loss.item(),
+                distill_loss=kd_loss.item(),
+                unmasked_rate=unmasked_rate
+            )
+            loss = model_args.kd_alpha * student_loss + (1.0 - model_args.kd_alpha) * kd_loss
             return (loss, outputs_student) if return_outputs else loss
-        
 
         def compute_cross_entropy_loss(self, logits, target):
-            loss = F.cross_entropy(logits.squeeze(0), target.squeeze(0) ,reduction='mean')
+            loss = F.cross_entropy(logits.squeeze(0), target.squeeze(0), reduction='mean')
             nll_loss = loss
             return loss, nll_loss
-        
 
-        def dist_func(
-            self, 
-            logits, 
-            teacher_logits, 
-            target=None,
-            reduction=None
-        ):
-            # self.loss_func = torch.nn.KLDivLoss(reduction='none')
-            lprobs = torch.log_softmax(logits/model_args.kd_temperature, -1, dtype=torch.float32)
+        def dist_func(self, logits, teacher_logits, target=None, reduction=None):
+            lprobs = torch.log_softmax(logits / model_args.kd_temperature, -1, dtype=torch.float32)
             teacher_probs = torch.softmax(teacher_logits, -1, dtype=torch.float32)
             teacher_lprobs = torch.log_softmax(teacher_logits, -1, dtype=torch.float32) * (model_args.kd_temperature ** 2)
             kld = (teacher_probs * (teacher_lprobs - lprobs))
             inf_mask = kld.isinf()
             kld = kld.masked_fill_(inf_mask, 0.0)
-            kld = kld.sum()/ torch.sum(~inf_mask).item()
-
-
+            kld = kld.sum() / torch.sum(~inf_mask).item()
             return kld
-        
 
-        def compute_edit_distance_kd_loss(
-            self, outputs_student, outputs_teacher, inputs
-        ):
-            target = inputs["labels"]
-            teacher_target = inputs[f"teacher_labels0"]
+        def compute_edit_distance_kd_loss(self, outputs_student, outputs_teacher, inputs):
+            target = inputs["labels"]                   # student MLM labels (-100 for unmasked tokens)
+            teacher_target = inputs["teacher_labels0"]  # -100 for teacher prefix (nếu có)
+
             student_logits = outputs_student.logits
             stu_tokenizer = self.student_tokenizer
             tea_tokenizer = self.teacher_tokenizer
@@ -474,19 +382,23 @@ def main():
             aligned_tea_logits = []
             aligned_stu_logits = []
             for i in range(bsz):
-                assert self.padding_id in target[i]
+                # Với MLM, positions có label != -100 là các token bị mask (cần dự đoán)
                 stu_content_idx = torch.nonzero(target[i].ne(self.padding_id)).view(-1)
-                stu_input_ids = inputs["input_ids"][i, stu_content_idx]
-
                 tea_content_idx = torch.nonzero(teacher_target[i].ne(self.padding_id)).view(-1)
-                tea_input_ids = inputs[f"teacher_input_ids0"][i, tea_content_idx]
+
+                if stu_content_idx.numel() == 0 or tea_content_idx.numel() == 0:
+                    # không có vị trí hợp lệ để KD
+                    continue
+
+                stu_input_ids = inputs["input_ids"][i, stu_content_idx]
+                tea_input_ids = inputs["teacher_input_ids0"][i, tea_content_idx]
 
                 try:
                     stu_per_step_logits = student_logits[i, stu_content_idx, :]
                     tea_per_step_logits = outputs_teacher.logits[i, tea_content_idx, :]
-                    if stu_per_step_logits.shape[-1]==0 or tea_per_step_logits.shape[-1]==0:
-                        return torch.Tensor([0.0]).to(student_logits.device), 0.0
-                
+                    if stu_per_step_logits.shape[-1] == 0 or tea_per_step_logits.shape[-1] == 0:
+                        continue
+
                     aligned_tea_content_per_step_logits, meaned_stu_content_logits, unmask_rate = self.transform_step_logits_fast(
                         stu_tokenizer,
                         tea_tokenizer,
@@ -495,17 +407,22 @@ def main():
                         tea_input_ids,
                         tea_per_step_logits,
                     )
-                except:
-                    return torch.Tensor([0.0]).to(student_logits.device), 0.0
+                except Exception as e:
+                    # print("align error:", e)
+                    continue
+
                 aligned_stu_logits.append(meaned_stu_content_logits)
                 aligned_tea_logits.append(aligned_tea_content_per_step_logits)
-                
+
+            if len(aligned_stu_logits) == 0:
+                return torch.tensor(0.0, device=student_logits.device), 0.0
+
             aligned_tea_logits = torch.stack(aligned_tea_logits, 0)
             aligned_stu_logits = torch.stack(aligned_stu_logits, 0)
             in_len = aligned_stu_logits.shape[1]
             kd_loss = self.dist_func(
-                aligned_stu_logits, 
-                aligned_tea_logits, 
+                aligned_stu_logits,
+                aligned_tea_logits,
                 inputs["labels"][:, -in_len:],
                 reduction='mean'
             )
@@ -513,9 +430,7 @@ def main():
 
         def merge_tensor(self, values, mapping_list):
             merged_values = []
-
             for ids in mapping_list:
-                # merged_values.append(values[ids[0]])
                 merged_values.append(values[ids].mean(dim=0))
             merged_values = torch.stack(merged_values, dim=0)
             return merged_values
@@ -529,219 +444,157 @@ def main():
             blending_model_input_ids: torch.LongTensor,
             blending_model_per_step_logits: torch.FloatTensor,
         ):
-            """faster implementation to align logits"""
+            """Align logits qua DTW + dynamic vocab mapping."""
             base_model_tokens = base_model_tokenizer.convert_ids_to_tokens(base_model_input_ids)
             base_model_tokens = [base_model_tokenizer.convert_tokens_to_string([tok]) for tok in base_model_tokens]
-            blending_model_tokens = blending_model_tokenizer.convert_ids_to_tokens(
-                blending_model_input_ids
-            )
+            blending_model_tokens = blending_model_tokenizer.convert_ids_to_tokens(blending_model_input_ids)
             blending_model_tokens = [blending_model_tokenizer.convert_tokens_to_string([tok]) for tok in blending_model_tokens]
-            if base_model_tokenizer.__class__ not in TOKENIZER_TO_SPECIAL_TOKEN:
-                # print("Warning: not implemented for base tokenizer!", base_model_tokenizer)
-                base_model_special_token = "Ġ"
-            else:
-                base_model_special_token = TOKENIZER_TO_SPECIAL_TOKEN[
-                    base_model_tokenizer.__class__
-                ]
-            if blending_model_tokenizer.__class__ not in TOKENIZER_TO_SPECIAL_TOKEN:
-                # print("Warning: not implemented for blending tokenizer!", blending_model_tokenizer)
-                blending_model_special_token = '_'
-            else:
-                blending_model_special_token = TOKENIZER_TO_SPECIAL_TOKEN[
-                    blending_model_tokenizer.__class__
-                ]
+
+            base_model_special_token = TOKENIZER_TO_SPECIAL_TOKEN.get(base_model_tokenizer.__class__, "Ġ")
+            blending_model_special_token = TOKENIZER_TO_SPECIAL_TOKEN.get(blending_model_tokenizer.__class__, "_")
 
             specTok_mapper = {
                 '</s>': '<|im_end|>',
-                '<|endoftext|>':'<|endoftext|>'
+                '<|endoftext|>': '<|endoftext|>'
             }
 
             def dist_fn(a, b):
-                """Calculate editdistance between two tokens, a is from blending model, b is from base model."""
                 if a in specTok_mapper and b in specTok_mapper.values():
                     return 0.0
                 if b in specTok_mapper and a in specTok_mapper.values():
                     return 0.0
-                aa = a.replace(blending_model_special_token, "")
-                bb = b.replace(base_model_special_token, "")
-                aa = a.replace(" ", "")
-                bb = b.replace(" ", "")
-                dist = editdistance.eval(aa, bb) 
-                if len(aa)==len(bb)==0:
+                aa = a.replace(blending_model_special_token, "").replace(" ", "")
+                bb = b.replace(base_model_special_token, "").replace(" ", "")
+                dist = editdistance.eval(aa, bb)
+                if len(aa) == len(bb) == 0:
                     return 0.0
-                dist = dist / (len(aa)+len(bb))
+                dist = dist / (len(aa) + len(bb))
                 return dist
-           
+
             def cost_fn(a, b):
-                """cost function for sequence alignment"""
                 if a in specTok_mapper and b in specTok_mapper.values():
                     return 0.0
                 if b in specTok_mapper and a in specTok_mapper.values():
                     return 0.0
-                aa = a.replace(blending_model_special_token, "")
-                bb = b.replace(base_model_special_token, "")
-                aa = a.replace(" ", "")
-                bb = b.replace(" ", "")
+                aa = a.replace(blending_model_special_token, "").replace(" ", "")
+                bb = b.replace(base_model_special_token, "").replace(" ", "")
                 dist = editdistance.eval(aa, bb)
                 return dist
-            
-            blending_dist_factor = calculate_weight(blending_model_per_step_logits) 
+
+            blending_dist_factor = calculate_weight(blending_model_per_step_logits)
             base_dist_factor = calculate_weight(base_model_per_step_logits)
-            # obtain sequence token alignment (each stu token to which tea token)
+
             _, _, blending_to_base, base_to_blending, _ = self.dtw(
                 blending_model_tokens, base_model_tokens, blending_dist_factor, base_dist_factor, norm_func=cost_fn
-            ) 
-
-            merged_blending_tokens = []
-            for ids in base_to_blending:
-                merged_token = ''
-                for id in ids:
-                    merged_token += blending_model_tokens[id]
-                merged_blending_tokens.append(merged_token)
-            
-            
-            
-            blending_model_per_step_logits = self.merge_tensor(
-                blending_model_per_step_logits,
-                base_to_blending
             )
+
+            # Gộp logits theo mapping
+            blending_model_per_step_logits = self.merge_tensor(blending_model_per_step_logits, base_to_blending)
+
             cnt_merge_blending_to_base = []
             for ids in blending_to_base:
                 if ids not in cnt_merge_blending_to_base:
                     cnt_merge_blending_to_base.append(ids)
-            blending_model_per_step_logits = self.merge_tensor(
-                blending_model_per_step_logits,
-                cnt_merge_blending_to_base
-            )
-            base_model_per_step_logits = self.merge_tensor(
-                base_model_per_step_logits,
-                cnt_merge_blending_to_base
-            )
-            
+            blending_model_per_step_logits = self.merge_tensor(blending_model_per_step_logits, cnt_merge_blending_to_base)
+            base_model_per_step_logits = self.merge_tensor(base_model_per_step_logits, cnt_merge_blending_to_base)
+
             topK = model_args.topk
             blending_topk_ids = torch.topk(blending_model_per_step_logits, topK).indices
             base_topk_ids = torch.topk(base_model_per_step_logits, topK).indices
-            
-            blending_topk_tokens = []
-            for ids in blending_topk_ids:
-                blending_topk_tokens.append([blending_model_tokenizer.decode(id) for id in ids])
-            
-            base_topk_tokens = []
-            for ids in base_topk_ids:
-                base_topk_tokens.append([base_model_tokenizer.decode(id) for id in ids])
+
+            blending_topk_tokens = [[blending_model_tokenizer.decode(i) for i in ids] for ids in blending_topk_ids]
+            base_topk_tokens = [[base_model_tokenizer.decode(i) for i in ids] for ids in base_topk_ids]
 
             tea2stu_mapper = self.tea2stu_id_mapping
-            def get_dymaic_mapper(
-                    blending_topk_ids, 
-                    base_topk_ids, 
-                    blending_topk_tokens, 
-                    base_topk_tokens, 
-                    blending2base_mapper=tea2stu_mapper,
-                    em_mapper=self.em_tea2stu_id_mapping,
-                ):
+
+            def get_dynamic_mapper(
+                blending_topk_ids,
+                base_topk_ids,
+                blending_topk_tokens,
+                base_topk_tokens,
+                blending2base_mapper=tea2stu_mapper,
+                em_mapper=self.em_tea2stu_id_mapping,
+            ):
                 dist_threashold = model_args.simi_threadshold
-                # get the exact matching result
                 em_converted_base_topk_ids = blending2base_mapper[blending_topk_ids]
-                # get the elements that are not exact match use a mask with 0 judgement
                 miss_hit_mask = torch.eq(em_converted_base_topk_ids, 0)
-                # get the unmapped base tokens, and the correspondent candidate tokens in teacher
+
                 unmapped_blending_list = []
-                # [base_topk_ids[pos] for pos in torch.nonzero(miss_hit_mask)]
-                for pos in torch.nonzero(miss_hit_mask): unmapped_blending_list.append(blending_topk_ids[pos[0]][pos[1]])
+                for pos in torch.nonzero(miss_hit_mask):
+                    unmapped_blending_list.append(blending_topk_ids[pos[0]][pos[1]])
 
                 unmapped_blending_tokens = [blending_topk_tokens[pos[0]][pos[1]] for pos in torch.nonzero(miss_hit_mask)]
                 candidate_list = [base_topk_ids[pos[0]] for pos in torch.nonzero(miss_hit_mask)]
                 candidate_tokens = [base_topk_tokens[pos[0]] for pos in torch.nonzero(miss_hit_mask)]
-                # traversal to get the supplemental mapping pairs.
+
                 matched_ids = torch.nonzero(torch.eq(blending2base_mapper.squeeze(0), 0)).reshape(-1).tolist()
                 matched_set = set(matched_ids)
-                new_mapper = {}
-                unmatch_list = []
-                if dist_threashold >0.0001:
-                    for id, token, cand_ids, cand_toks in zip(unmapped_blending_list, unmapped_blending_tokens, candidate_list, candidate_tokens):
-                        # if the token is already mapped in Exact Matching Mode, skip
-                        if em_mapper[id]!=0:
+                if dist_threashold > 0.0001:
+                    for id_, token, cand_ids, cand_toks in zip(unmapped_blending_list, unmapped_blending_tokens, candidate_list, candidate_tokens):
+                        if em_mapper[id_] != 0:
                             continue
                         cand_ids = cand_ids.tolist()
-                        cand_mapper = {tid:tok for tok, tid in zip(cand_toks, cand_ids)}
+                        cand_mapper = {tid: tok for tok, tid in zip(cand_toks, cand_ids)}
                         cand_ids = list(set(cand_ids).difference(matched_set))
-                        if len(cand_ids)==0:
+                        if len(cand_ids) == 0:
                             continue
-                        min_dist = 1000
+                        min_dist = 1e9
                         simi_id = 0
                         for cand_id in cand_ids:
                             cand_tok = cand_mapper[cand_id]
                             tok_dist = dist_fn(token, cand_tok)
-                            if tok_dist<dist_threashold and tok_dist<min_dist:
+                            if tok_dist < dist_threashold and tok_dist < min_dist:
                                 simi_id = cand_id
                                 min_dist = tok_dist
-                        if simi_id!=0:
-                            # update the mapper, keep the life cycle in the whole training step
-                            blending2base_mapper[id] = simi_id
-                            new_mapper[token] = cand_mapper[simi_id]
-                        else:
-                            unmatch_list.append(token)
+                        if simi_id != 0:
+                            blending2base_mapper[id_] = simi_id
 
-                        # import pdb;pdb.set_trace()
-                    # print(new_mapper)
-                    # print(unmatch_list)
-                    # exit(0)
                 converted_base_topk_ids = blending2base_mapper[blending_topk_ids].to(blending_model_per_step_logits.device)
                 unmatch_mask = torch.eq(converted_base_topk_ids, 0)
                 masked_blending_topk_ids = blending_topk_ids.masked_fill_(unmatch_mask, 0)
                 return converted_base_topk_ids, masked_blending_topk_ids
 
-            # this block, convert the student token id to map the teacher top 100
             base_logits = []
             blending_logits = []
-            stu_converted_topk_ids, tea_converted_topk_ids = get_dymaic_mapper(
-                blending_topk_ids, 
-                base_topk_ids, 
-                blending_topk_tokens, 
-                base_topk_tokens, 
+
+            # Teacher->Student
+            stu_converted_topk_ids, tea_converted_topk_ids = get_dynamic_mapper(
+                blending_topk_ids, base_topk_ids, blending_topk_tokens, base_topk_tokens,
                 blending2base_mapper=copy.deepcopy(self.tea2stu_id_mapping),
                 em_mapper=self.em_tea2stu_id_mapping,
-                )
-
-            # for debug concrete mapped tokens
-            # stu_converted_topk_ids = self.tea2stu_id_mapping[blending_topk_ids]
-            # tea_converted_tokens = [self.teacher_tokenizer.convert_tokens_to_string(self.teacher_tokenizer.convert_ids_to_tokens([tok_id])) for tok_id in  tea_converted_topk_ids[0]]
-            # stu_converted_tokens = [self.student_tokenizer.convert_tokens_to_string(self.student_tokenizer.convert_ids_to_tokens([tok_id])) for tok_id in  stu_converted_topk_ids[0]]
+            )
             stu_model_per_step_logits = base_model_per_step_logits.gather(-1, stu_converted_topk_ids)
             tea_model_per_step_logits = blending_model_per_step_logits.gather(-1, tea_converted_topk_ids)
 
-            stu_logit_mask = stu_converted_topk_ids.eq(0)            
+            stu_logit_mask = stu_converted_topk_ids.eq(0)
+            tea_logit_mask = tea_converted_topk_ids.eq(0)
             stu_model_per_step_logits.masked_fill_(stu_logit_mask, -10000.0)
-            tea_logit_mask = tea_converted_topk_ids.eq(0)            
             tea_model_per_step_logits.masked_fill_(tea_logit_mask, -10000.0)
             mask_rate = stu_logit_mask.sum().item() / (stu_logit_mask.size(0) * stu_logit_mask.size(1))
 
             base_logits.append(tea_model_per_step_logits)
             blending_logits.append(stu_model_per_step_logits)
 
-            # another direction
-            tea_converted_topk_ids, stu_converted_topk_ids = get_dymaic_mapper(
-                base_topk_ids, 
-                blending_topk_ids, 
-                base_topk_tokens, 
-                blending_topk_tokens, 
+            # Student->Teacher
+            tea_converted_topk_ids, stu_converted_topk_ids = get_dynamic_mapper(
+                base_topk_ids, blending_topk_ids, base_topk_tokens, blending_topk_tokens,
                 blending2base_mapper=copy.deepcopy(self.stu2tea_id_mapping),
-                em_mapper=self.em_stu2tea_id_mapping
-                )
-            stu_model_per_step_logits = base_model_per_step_logits.gather(-1, stu_converted_topk_ids)
-            tea_model_per_step_logits = blending_model_per_step_logits.gather(-1, tea_converted_topk_ids)
-            stu_logit_mask = stu_converted_topk_ids.eq(0)            
-            stu_model_per_step_logits.masked_fill_(stu_logit_mask, -10000.0)
-            tea_logit_mask = tea_converted_topk_ids.eq(0)            
-            tea_model_per_step_logits.masked_fill_(tea_logit_mask, -10000.0)
-            mask_rate += stu_logit_mask.sum().item() / (stu_logit_mask.size(0) * stu_logit_mask.size(1))
-            mask_rate = mask_rate/2
-            base_logits.append(stu_model_per_step_logits)
-            blending_logits.append(tea_model_per_step_logits)
+                em_mapper=self.em_stu2tea_id_mapping,
+            )
+            stu_model_per_step_logits_2 = base_model_per_step_logits.gather(-1, stu_converted_topk_ids)
+            tea_model_per_step_logits_2 = blending_model_per_step_logits.gather(-1, tea_converted_topk_ids)
 
+            stu_logit_mask2 = stu_converted_topk_ids.eq(0)
+            tea_logit_mask2 = tea_converted_topk_ids.eq(0)
+            stu_model_per_step_logits_2.masked_fill_(stu_logit_mask2, -10000.0)
+            tea_model_per_step_logits_2.masked_fill_(tea_logit_mask2, -10000.0)
+            mask_rate += stu_logit_mask2.sum().item() / (stu_logit_mask2.size(0) * stu_logit_mask2.size(1))
+            mask_rate = mask_rate / 2
 
-            return torch.cat(base_logits, dim=-1), torch.cat(blending_logits, dim=-1), 1-mask_rate
+            base_logits.append(stu_model_per_step_logits_2)
+            blending_logits.append(tea_model_per_step_logits_2)
 
+            return torch.cat(base_logits, dim=-1), torch.cat(blending_logits, dim=-1), 1 - mask_rate
 
         # @timer
         def dtw(self, series_1, series_2, series1_factor, series2_factor, norm_func=np.linalg.norm):
@@ -752,17 +605,13 @@ def main():
             for i, (vec1, fc1) in enumerate(zip(series_1, series1_factor)):
                 for j, (vec2, fc2) in enumerate(zip(series_2, series2_factor)):
                     cost = norm_func(vec1, vec2) * fc1 * fc2
-                    
-                    # cost = norm_func(vec1, vec2)
-                    matrix[i + 1, j + 1] = cost + min(
-                        matrix[i, j + 1], matrix[i + 1, j], matrix[i, j]
-                    )
+                    matrix[i + 1, j + 1] = cost + min(matrix[i, j + 1], matrix[i + 1, j], matrix[i, j])
             matrix = matrix[1:, 1:]
             i = matrix.shape[0] - 1
             j = matrix.shape[1] - 1
             matches = []
-            mappings_series_1 = [list() for v in range(matrix.shape[0])]
-            mappings_series_2 = [list() for v in range(matrix.shape[1])]
+            mappings_series_1 = [list() for _ in range(matrix.shape[0])]
+            mappings_series_2 = [list() for _ in range(matrix.shape[1])]
             while i > 0 or j > 0:
                 matches.append((i, j))
                 mappings_series_1[i].append(j)
@@ -786,28 +635,16 @@ def main():
                 mp.reverse()
             for mp in mappings_series_2:
                 mp.reverse()
-
             return matches, matrix[-1, -1], mappings_series_1, mappings_series_2, matrix
-
-
 
         def log(self, logs):
             if not model_args.enable_edit_kd:
                 sft_loss, distill_loss = self.distill_metrics.compute()
-                logs.update({
-                    'sft_loss': sft_loss,
-                    'distill_loss': distill_loss,
-                })
+                logs.update({'sft_loss': sft_loss, 'distill_loss': distill_loss})
             else:
                 sft_loss, distill_loss, unmasked_rate = self.distill_metrics.compute()
-                logs.update({
-                    'sft_loss': sft_loss,
-                    'distill_loss': distill_loss,
-                    'unmasked_rate': unmasked_rate
-                })
-            
+                logs.update({'sft_loss': sft_loss, 'distill_loss': distill_loss, 'unmasked_rate': unmasked_rate})
             super().log(logs)
-
 
     # Detecting last checkpoint.
     last_checkpoint = None
@@ -824,11 +661,10 @@ def main():
                 "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
             )
 
-    # Set seed before initializing model.
     set_seed(training_args.seed)
 
+    # Load dataset
     if data_args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
         raw_datasets = load_dataset(
             data_args.dataset_name,
             data_args.dataset_config_name,
@@ -856,7 +692,7 @@ def main():
         if data_args.train_file is not None:
             data_files["train"] = data_args.train_file
             if len(data_args.train_file.split(',')) > 0:
-                data_files["train"] = data_args.train_file.split(',')            
+                data_files["train"] = data_args.train_file.split(',')
         if data_args.validation_file is not None:
             data_files["validation"] = data_args.validation_file
         extension = (
@@ -867,8 +703,6 @@ def main():
         if extension == "txt":
             extension = "text"
             dataset_args["keep_linebreaks"] = data_args.keep_linebreaks
-        print(data_files)
-        print(dataset_args)
         raw_datasets = load_dataset(
             extension,
             data_files=data_files,
@@ -877,7 +711,6 @@ def main():
             ignore_verifications=False,
             **dataset_args,
         )
-        # If no validation data is there, validation_split_percentage will be used to divide the dataset.
         if "validation" not in raw_datasets.keys():
             raw_datasets["validation"] = load_dataset(
                 extension,
@@ -894,13 +727,8 @@ def main():
                 **dataset_args,
             )
 
-
-
-    config_kwargs = {
-        # "cache_dir": model_args.cache_dir,
-        "revision": model_args.model_revision,
-        "use_auth_token": True if model_args.use_auth_token else None,
-    }
+    # Config & tokenizer
+    config_kwargs = {"revision": model_args.model_revision, "use_auth_token": True if model_args.use_auth_token else None}
     if model_args.config_name:
         config = AutoConfig.from_pretrained(model_args.config_name, trust_remote_code=True, **config_kwargs)
     elif model_args.model_name_or_path:
@@ -914,7 +742,6 @@ def main():
             logger.info(f"New config: {config}")
 
     tokenizer_kwargs = {
-        # "cache_dir": model_args.cache_dir,
         "use_fast": model_args.use_fast_tokenizer,
         "revision": model_args.model_revision,
         "use_auth_token": True if model_args.use_auth_token else None,
@@ -925,17 +752,17 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, trust_remote_code=True, **tokenizer_kwargs)
     else:
         raise ValueError(
-            "You are instantiating a new tokenizer from scratch. This is not supported by this script."
-            "You can do it from another script, save it, and load it from here, using --tokenizer_name."
+            "You are instantiating a new tokenizer from scratch. Not supported by this script."
         )
 
+    # Load models
     if model_args.model_name_or_path:
         torch_dtype = (
             model_args.torch_dtype
             if model_args.torch_dtype in ["auto", None]
             else getattr(torch, model_args.torch_dtype)
         )
-        
+
         if model_args.student_arch == "masked_lm":
             model = AutoModelForMaskedLM.from_pretrained(
                 model_args.model_name_or_path,
@@ -955,10 +782,11 @@ def main():
                 revision=model_args.model_revision,
                 use_auth_token=True if model_args.use_auth_token else None,
             )
-        # model.config.use_cache = False
+
         if training_args.gradient_checkpointing:
             print("Setting enable_input_require_grads")
             model.enable_input_require_grads()
+
         teachers = []
         teacher_tokenizers = []
         for teacher_path in model_args.teacher_path.split(','):
@@ -973,10 +801,12 @@ def main():
                 teacher_path,
                 trust_remote_code=True
             )
+            if teacher_tokenizer.pad_token is None and teacher_tokenizer.eos_token is not None:
+                teacher_tokenizer.pad_token = teacher_tokenizer.eos_token
             teachers.append(teacher)
             teacher_tokenizers.append(teacher_tokenizer)
-   
-        print("freeze_layers:",model_args.freeze_layers)
+
+        print("freeze_layers:", model_args.freeze_layers)
         print('freeze_emb', model_args.freeze_emb)
         if model_args.freeze_layers is not None or model_args.freeze_emb is not None:
             for name, param in model.named_parameters():
@@ -985,111 +815,136 @@ def main():
                     param.requires_grad = False
                 if model_args.freeze_layers is not None:
                     for layer in model_args.freeze_layers.split(','):
-                        if "model.layers.{}.".format(layer) in name:
+                        if f"model.layers.{layer}." in name:
                             param.requires_grad = False
-                            # freeze_flag = True
                             print("freezing param:", name)
-
-
-
-
-
     else:
         model = AutoModelForCausalLM.from_config(config)
         n_params = sum({p.data_ptr(): p.numel() for p in model.parameters()}.values())
         logger.info(f"Training new model from scratch - Total size={n_params/2**20:.2f}M params")
-    # model = torch.compile(model)
-    # xxx: 2023-03-21, add padding
+
+    # Padding token & side
     if tokenizer.pad_token is None:
         tokenizer.add_special_tokens(dict(pad_token=DEFAULT_PAD_TOKEN))
-    # Padding side: left cho causal LM, right cho MLM/BERT
     tokenizer.padding_side = "right" if model_args.student_arch == "masked_lm" else "left"
-        # tokenizer.padding_side = data_args.padding_side
-    print("debug: tokenizer.padding_side =", tokenizer.padding_side )    
+    print("debug: tokenizer.padding_side =", tokenizer.padding_side)
 
-    # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
-    # on a small vocab and want a smaller embedding size, remove this test.
+    # Resize embeddings if needed
     embedding_size = model.get_input_embeddings().weight.shape[0]
     if len(tokenizer) > embedding_size:
         model.resize_token_embeddings(len(tokenizer))
 
+    # Columns
     if training_args.do_train:
         column_names = list(raw_datasets["train"].features)
     else:
         column_names = list(raw_datasets["validation"].features)
     text_column_name = "text" if "text" in column_names else column_names[0]
 
-
-
+    # Block size
     if data_args.block_size is None:
         block_size = tokenizer.model_max_length
         if block_size > 1024:
             logger.warning(
-                "The chosen tokenizer supports a `model_max_length` that is longer than the default `block_size` value"
-                " of 1024. If you would like to use a longer `block_size` up to `tokenizer.model_max_length` you can"
-                " override this default with `--block_size xxx`."
+                "Tokenizer model_max_length > 1024; default block_size=1024. Override with --block_size if needed."
             )
             block_size = 1024
     else:
         if data_args.block_size > tokenizer.model_max_length:
             logger.warning(
-                f"The block_size passed ({data_args.block_size}) is larger than the maximum length for the model"
-                f"({tokenizer.model_max_length}). Using block_size={tokenizer.model_max_length}."
+                f"block_size ({data_args.block_size}) > tokenizer.model_max_length ({tokenizer.model_max_length}). "
+                f"Using block_size={tokenizer.model_max_length}."
             )
         block_size = min(data_args.block_size, tokenizer.model_max_length)
         print("debug: the actual block_size is ", block_size, "   tokenizer.model_max_length=", tokenizer.model_max_length)
 
-
-    # xxx: 2023-03-14
+    # Preprocess
     tok_logger = transformers.utils.logging.get_logger("transformers.tokenization_utils_base")
     is_mlm_student = (model_args.student_arch == "masked_lm")
+
     def preprocess_function(examples):
         with CaptureLogger(tok_logger) as cl:
-            # padding = "max_length"  # or False
             padding = False
-            text = examples[text_column_name]  # may have multiple strings
+            text = examples[text_column_name]
+
             if "prefix" in column_names:
-                prefix = examples["prefix"] 
-                text = [s + t if is_mlm_student else s + t + (tokenizer.eos_token or "") for s, t in zip(prefix, text)]
-                prefix_tokenized = tokenizer(prefix, truncation=True, max_length=block_size, padding=False)
-                text_tokenized = tokenizer(text, truncation=True, max_length=block_size, padding=padding)
+                prefix = examples["prefix"]
+                stu_text = [s + t + ("" if is_mlm_student else (tokenizer.eos_token or "")) for s, t in zip(prefix, text)]
+
+                prefix_tok = tokenizer(prefix, truncation=True, max_length=block_size, padding=False)
+                stu_tok   = tokenizer(stu_text, truncation=True, max_length=block_size, padding=padding)
+
+                teacher_tokenizer = teacher_tokenizers[0]
+                if teacher_tokenizer.pad_token is None and teacher_tokenizer.eos_token is not None:
+                    teacher_tokenizer.pad_token = teacher_tokenizer.eos_token
+                tea_text = [s + t + (teacher_tokenizer.eos_token or "") for s, t in zip(prefix, text)]
+                tea_prefix_tok = teacher_tokenizer(prefix, truncation=True, max_length=block_size, padding=False)
+                tea_tok        = teacher_tokenizer(tea_text, truncation=True, max_length=block_size, padding=padding)
+
                 if not is_mlm_student:
-                    labels = copy.deepcopy(text_tokenized["input_ids"])
-                if "gpt2" in model_args.model_name_or_path:
-                    text_tokenized['position_ids'] = [i for i in range(len(prefix_tokenized["input_ids"]))]
-    
-                prefix_lengths = [len(p) for p in prefix_tokenized["input_ids"]]
+                    labels = copy.deepcopy(stu_tok["input_ids"])
+                    prefix_lens = [len(p) for p in prefix_tok["input_ids"]]
+                    for lab, p_len in zip(labels, prefix_lens):
+                        lab[:p_len] = [IGNORE_INDEX] * p_len
+                    stu_tok["labels"] = labels
+
+                tea_labels = copy.deepcopy(tea_tok["input_ids"])
+                tea_prefix_lens = [len(p) for p in tea_prefix_tok["input_ids"]]
+                for lab, p_len in zip(tea_labels, tea_prefix_lens):
+                    lab[:p_len] = [IGNORE_INDEX] * p_len
+
+                stu_tok["teacher_labels0"] = tea_labels
+                stu_tok["teacher_input_ids0"] = tea_tok["input_ids"]
+                stu_tok["teacher_attention_mask0"] = tea_tok["attention_mask"]
+                text_tokenized = stu_tok
+
+            elif "input" in column_names:
+                prefix = [ins + '\n### Input:\n' + inp for ins, inp in zip(examples['instruction'], examples['input'])]
+                out_text = [p + "\n### Output:\n" + o for p, o in zip(prefix, examples['output'])]
+                stu_text = [t + ("" if is_mlm_student else (tokenizer.eos_token or "")) for t in out_text]
+
+                prefix_tok = tokenizer(prefix, truncation=True, max_length=block_size, padding=False)
+                stu_tok    = tokenizer(stu_text, truncation=True, max_length=block_size, padding=padding)
+
                 if not is_mlm_student:
-                    for label, prefix_len in zip(labels, prefix_lengths):  # Do not compute loss for prompt inputs
-                        label[:prefix_len] = [IGNORE_INDEX] * prefix_len  # [IGNORE_INDEX for i in range(prefix_len)]
-                for i, teacher_tokenizer in enumerate(teacher_tokenizers):
-                    text = [t.replace(tokenizer.eos_token, teacher_tokenizer.eos_token) for t in text]
-                    teacher_prefix_tokenized = teacher_tokenizer(prefix, truncation=True, max_length=block_size, padding=False)
-                    teacher_text_tokenized = teacher_tokenizer(tea_text, truncation=True, max_length=block_size, padding=padding)
-                    teacher_labels = copy.deepcopy(teacher_text_tokenized["input_ids"])
-            
-                    teacher_prefix_lengths = [len(p) for p in teacher_prefix_tokenized["input_ids"]]
-                    for label, prefix_len in zip(teacher_labels, teacher_prefix_lengths):  
-                        label[:prefix_len] = [IGNORE_INDEX] * prefix_len 
-                    
-                    text_tokenized[f'teacher_labels{i}'] = teacher_labels
-                    text_tokenized[f'teacher_input_ids{i}'] = teacher_text_tokenized['input_ids']
-                    text_tokenized[f'teacher_attention_mask{i}'] = teacher_text_tokenized['attention_mask']
-            elif 'input' in column_names:
-                prefix = [ins +'\n### Input:\n'+ inp for ins, inp in zip(examples['instruction'], examples['input'])]
-                text = [p + "\n### Output:\n"+ o + tokenizer.eos_token for p, o in zip(prefix, examples['output'])]
-                prefix_tokenized = tokenizer(prefix, truncation=True, max_length=block_size, padding=False)
-                text_tokenized = tokenizer(text, truncation=True, max_length=block_size, padding=padding)
-                labels = copy.deepcopy(text_tokenized["input_ids"])
-                prefix_lengths = [len(p) for p in prefix_tokenized["input_ids"]]
-                for label, prefix_len in zip(labels, prefix_lengths):  # Do not compute loss for prompt inputs
-                    label[:prefix_len] = [IGNORE_INDEX] * prefix_len  # [IGNORE_INDEX for i in range(prefix_len)]
+                    labels = copy.deepcopy(stu_tok["input_ids"])
+                    prefix_lens = [len(p) for p in prefix_tok["input_ids"]]
+                    for lab, p_len in zip(labels, prefix_lens):
+                        lab[:p_len] = [IGNORE_INDEX] * p_len
+                    stu_tok["labels"] = labels
+
+                teacher_tokenizer = teacher_tokenizers[0]
+                if teacher_tokenizer.pad_token is None and teacher_tokenizer.eos_token is not None:
+                    teacher_tokenizer.pad_token = teacher_tokenizer.eos_token
+                tea_text = [t + (teacher_tokenizer.eos_token or "") for t in out_text]
+                tea_tok  = teacher_tokenizer(tea_text, truncation=True, max_length=block_size, padding=padding)
+
+                # Ở nhánh này không có prefix riêng cho teacher; dùng full labels (hoặc sau collator pad -100)
+                stu_tok["teacher_labels0"] = copy.deepcopy(tea_tok["input_ids"])
+                stu_tok["teacher_input_ids0"] = tea_tok["input_ids"]
+                stu_tok["teacher_attention_mask0"] = tea_tok["attention_mask"]
+                text_tokenized = stu_tok
 
             else:
-                text = [t+tokenizer.eos_token for t in text]
-                text_tokenized = tokenizer(text, truncation=True, max_length=block_size, padding=False)
-                labels = copy.deepcopy(text_tokenized["input_ids"])
-            text_tokenized["labels"] = labels
+                # plain text
+                stu_text = [t + ("" if is_mlm_student else (tokenizer.eos_token or "")) for t in text]
+                stu_tok  = tokenizer(stu_text, truncation=True, max_length=block_size, padding=padding)
+
+                if not is_mlm_student:
+                    labels = copy.deepcopy(stu_tok["input_ids"])
+                    stu_tok["labels"] = labels
+
+                teacher_tokenizer = teacher_tokenizers[0]
+                if teacher_tokenizer.pad_token is None and teacher_tokenizer.eos_token is not None:
+                    teacher_tokenizer.pad_token = teacher_tokenizer.eos_token
+                tea_text = [t + (teacher_tokenizer.eos_token or "") for t in text]
+                tea_tok  = teacher_tokenizer(tea_text, truncation=True, max_length=block_size, padding=padding)
+
+                stu_tok["teacher_labels0"] = copy.deepcopy(tea_tok["input_ids"])
+                stu_tok["teacher_input_ids0"] = tea_tok["input_ids"]
+                stu_tok["teacher_attention_mask0"] = tea_tok["attention_mask"]
+                text_tokenized = stu_tok
+
         if "Token indices sequence length is longer than the" in cl.out:
             tok_logger.warning(
                 "^^^^^^^^^^^^^^^^ Please ignore the warning above - this long input will be chunked into smaller bits"
@@ -1097,60 +952,37 @@ def main():
             )
         return text_tokenized
 
-
-    # xxx: 2023-03-17
     with training_args.main_process_first(desc="example per line with padding"):
-        if not data_args.streaming:
-            lm_datasets = raw_datasets.map(
-                preprocess_function,
-                batched=True,
-                num_proc=data_args.preprocessing_num_workers,
-                remove_columns=column_names,
-                desc=f"Tokenize with padding",
-            )
-        else:
-            lm_datasets = raw_datasets.map(
-                preprocess_function,
-                batched=True,
-                num_proc=data_args.preprocessing_num_workers,
-                remove_columns=column_names,
-                desc=f"Tokenize with padding",
-            )
-
+        lm_datasets = raw_datasets.map(
+            preprocess_function,
+            batched=True,
+            num_proc=data_args.preprocessing_num_workers,
+            remove_columns=column_names,
+            desc=f"Tokenize with padding",
+        )
 
     if training_args.do_train:
-        #if "train" not in tokenized_datasets:
-        # xxx: 2023-03-14
         if "train" not in lm_datasets:
             raise ValueError("--do_train requires a train dataset")
         train_dataset = lm_datasets["train"]
         if data_args.max_train_samples is not None:
             max_train_samples = min(len(train_dataset), data_args.max_train_samples)
             train_dataset = train_dataset.select(range(max_train_samples))
-        
-        
         print(train_dataset)
         if not data_args.streaming:
             train_dataset = train_dataset.shuffle(seed=training_args.seed)
         else:
-            #train_dataset = train_dataset.shuffle(seed=training_args.seed, buffer_size=data_args.shuffle_buffer_size)        
             train_dataset = train_dataset.shuffle(seed=training_args.seed)
 
-        # xxx: print samples
         logger.info("xxx: Showcase the tokenized training samples.")
         tmp_idx = 0
         for tmp_example in train_dataset:
             if tmp_idx > 3:
                 break
-            if len(tmp_example["input_ids"]) > 3000 or True:
-                tmp_idx += 1
-                print(tmp_example)
-        #for i in range(99999):
-        #    print(next(iter(train_dataset)))
+            tmp_idx += 1
+            print(tmp_example)
 
     if training_args.do_eval:
-        #if "validation" not in tokenized_datasets:
-        # xxx: 2023-03-14
         if "validation" not in lm_datasets:
             raise ValueError("--do_eval requires a validation dataset")
         eval_dataset = lm_datasets["validation"]
@@ -1160,28 +992,38 @@ def main():
 
         def preprocess_logits_for_metrics(logits, labels):
             if isinstance(logits, tuple):
-                # Depending on the model and config, logits may contain extra tensors,
-                # like past_key_values, but logits always come first
                 logits = logits[0]
             return logits.argmax(dim=-1)
 
-        #metric = evaluate.load("accuracy")
-
         def compute_metrics(eval_preds):
             preds, labels = eval_preds
-            # preds have the same shape as the labels, after the argmax(-1) has been calculated
-            # by preprocess_logits_for_metrics but we need to shift the labels
             labels = labels[:, 1:].reshape(-1)
             preds = preds[:, :-1].reshape(-1)
             try:
-                return {"accuracy":torch.sum(preds == labels)/len(labels)}
+                return {"accuracy": torch.sum(preds == labels) / len(labels)}
             except:
-                return {"accuracy":(torch.sum(torch.tensor(preds) == torch.tensor(labels)).to(device=training_args.device)/len(labels))}
-            #return metric.compute(predictions=preds, references=labels)
+                return {"accuracy": (torch.sum(torch.tensor(preds) == torch.tensor(labels)).to(device=training_args.device) / len(labels))}
+    else:
+        preprocess_logits_for_metrics = None
+        compute_metrics = None
 
-    # Initialize our Trainer
     training_args.remove_unused_columns = False
 
+    # Chọn collator & metric theo student_arch
+    if model_args.student_arch == "masked_lm":
+        data_collator = CDMMLMCollator(
+            student_tokenizer=tokenizer,
+            teacher_tokenizer=teacher_tokenizers[0],
+            mlm_probability=model_args.mlm_probability,
+        )
+        cm = None
+        plfm = None
+    else:
+        data_collator = transformers.DataCollatorForSeq2Seq(
+            tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True, label_pad_token_id=IGNORE_INDEX
+        )
+        cm = compute_metrics if training_args.do_eval and not is_torch_tpu_available() else None
+        plfm = preprocess_logits_for_metrics if training_args.do_eval and not is_torch_tpu_available() else None
 
     trainer = DistillationTrainer(
         model=model,
@@ -1191,15 +1033,11 @@ def main():
         train_dataset=train_dataset if training_args.do_train else None,
         eval_dataset=eval_dataset if training_args.do_eval else None,
         tokenizer=tokenizer,
-        data_collator=transformers.DataCollatorForSeq2Seq(tokenizer, pad_to_multiple_of=8, return_tensors="pt",
-                                                          padding=True, label_pad_token_id=IGNORE_INDEX),
-        compute_metrics=compute_metrics if training_args.do_eval and not is_torch_tpu_available() else None,
-        preprocess_logits_for_metrics=preprocess_logits_for_metrics
-        if training_args.do_eval and not is_torch_tpu_available()
-        else None,
+        data_collator=data_collator,
+        compute_metrics=cm,
+        preprocess_logits_for_metrics=plfm,
     )
 
-    # Training
     if training_args.do_train:
         checkpoint = None
         if training_args.resume_from_checkpoint is not None:
@@ -1209,20 +1047,16 @@ def main():
                 checkpoint = training_args.resume_from_checkpoint
         elif last_checkpoint is not None:
             checkpoint = last_checkpoint
+
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
-        trainer.save_model()  # Saves the tokenizer too for easy upload
+        trainer.save_model()
 
         metrics = train_result.metrics
-
-        max_train_samples = (
-            data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset)
-        )
+        max_train_samples = data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset)
         metrics["train_samples"] = min(max_train_samples, len(train_dataset))
-
         trainer.log_metrics("train", metrics)
         trainer.save_metrics("train", metrics)
         trainer.save_state()
-
 
     kwargs = {"finetuned_from": model_args.model_name_or_path, "tasks": "text-generation"}
     if data_args.dataset_name is not None:
@@ -1240,7 +1074,6 @@ def main():
 
 
 def _mp_fn(index):
-    # For xla_spawn (TPUs)
     main()
 
 
