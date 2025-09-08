@@ -27,6 +27,7 @@ from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
+    AutoModelForMaskedLM,
     HfArgumentParser,
     # Trainer,
     TrainingArguments,
@@ -39,6 +40,7 @@ from transformers import TrainerCallback
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import send_example_telemetry
 from transformers.utils.versions import require_version
+from transformers import DataCollatorForLanguageModeling
 # xxx: 2023-03-21
 import copy
 import torch.nn as nn
@@ -69,6 +71,8 @@ TOKENIZER_TO_SPECIAL_TOKEN = {
     transformers.GPT2TokenizerFast: "Ġ",
     transformers.Qwen2Tokenizer: "Ġ",
     transformers.Qwen2TokenizerFast: "Ġ",
+    transformers.BertTokenizer: "##",
+    transformers.BertTokenizerFast: "##",
 }
 
 # require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/language-modeling/requirements.txt")
@@ -183,6 +187,15 @@ class ModelArguments:
     )
     kd_temperature: Optional[float] = field(
         default=0.8
+    )
+    # --- NEW: hỗ trợ student là encoder (MaskedLM/BERT)
+    student_arch: Optional[str] = field(
+        default="masked_lm",
+        metadata={"help": "Student architecture: 'masked_lm' (BERT) hoặc 'causal_lm'."},
+    )
+    mlm_probability: Optional[float] = field(
+        default=0.15,
+        metadata={"help": "Tỷ lệ mask khi student_arch == 'masked_lm'."},
     )
     enable_edit_kd: Optional[bool] = field(
         default=False,
@@ -923,15 +936,25 @@ def main():
             else getattr(torch, model_args.torch_dtype)
         )
         
-        model = AutoModelForCausalLM.from_pretrained(
-            model_args.model_name_or_path,
-            from_tf=bool(".ckpt" in model_args.model_name_or_path),
-            config=config,
-            trust_remote_code=True,
-            cache_dir=model_args.cache_dir,
-            revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None,
-        )
+        if model_args.student_arch == "masked_lm":
+            model = AutoModelForMaskedLM.from_pretrained(
+                model_args.model_name_or_path,
+                config=config if config is not None else None,
+                trust_remote_code=True,
+                cache_dir=model_args.cache_dir,
+                revision=model_args.model_revision,
+                use_auth_token=True if model_args.use_auth_token else None,
+            )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_args.model_name_or_path,
+                from_tf=bool(".ckpt" in model_args.model_name_or_path),
+                config=config,
+                trust_remote_code=True,
+                cache_dir=model_args.cache_dir,
+                revision=model_args.model_revision,
+                use_auth_token=True if model_args.use_auth_token else None,
+            )
         # model.config.use_cache = False
         if training_args.gradient_checkpointing:
             print("Setting enable_input_require_grads")
@@ -979,8 +1002,8 @@ def main():
     # xxx: 2023-03-21, add padding
     if tokenizer.pad_token is None:
         tokenizer.add_special_tokens(dict(pad_token=DEFAULT_PAD_TOKEN))
-    # if data_args.padding_side is not None:
-    tokenizer.padding_side = "left"
+    # Padding side: left cho causal LM, right cho MLM/BERT
+    tokenizer.padding_side = "right" if model_args.student_arch == "masked_lm" else "left"
         # tokenizer.padding_side = data_args.padding_side
     print("debug: tokenizer.padding_side =", tokenizer.padding_side )    
 
@@ -1019,6 +1042,7 @@ def main():
 
     # xxx: 2023-03-14
     tok_logger = transformers.utils.logging.get_logger("transformers.tokenization_utils_base")
+    is_mlm_student = (model_args.student_arch == "masked_lm")
     def preprocess_function(examples):
         with CaptureLogger(tok_logger) as cl:
             # padding = "max_length"  # or False
@@ -1026,20 +1050,22 @@ def main():
             text = examples[text_column_name]  # may have multiple strings
             if "prefix" in column_names:
                 prefix = examples["prefix"] 
-                text = [s + t+tokenizer.eos_token for s, t in zip(prefix, text)]
+                text = [s + t if is_mlm_student else s + t + (tokenizer.eos_token or "") for s, t in zip(prefix, text)]
                 prefix_tokenized = tokenizer(prefix, truncation=True, max_length=block_size, padding=False)
                 text_tokenized = tokenizer(text, truncation=True, max_length=block_size, padding=padding)
-                labels = copy.deepcopy(text_tokenized["input_ids"])
+                if not is_mlm_student:
+                    labels = copy.deepcopy(text_tokenized["input_ids"])
                 if "gpt2" in model_args.model_name_or_path:
                     text_tokenized['position_ids'] = [i for i in range(len(prefix_tokenized["input_ids"]))]
     
                 prefix_lengths = [len(p) for p in prefix_tokenized["input_ids"]]
-                for label, prefix_len in zip(labels, prefix_lengths):  # Do not compute loss for prompt inputs
-                    label[:prefix_len] = [IGNORE_INDEX] * prefix_len  # [IGNORE_INDEX for i in range(prefix_len)]
+                if not is_mlm_student:
+                    for label, prefix_len in zip(labels, prefix_lengths):  # Do not compute loss for prompt inputs
+                        label[:prefix_len] = [IGNORE_INDEX] * prefix_len  # [IGNORE_INDEX for i in range(prefix_len)]
                 for i, teacher_tokenizer in enumerate(teacher_tokenizers):
                     text = [t.replace(tokenizer.eos_token, teacher_tokenizer.eos_token) for t in text]
                     teacher_prefix_tokenized = teacher_tokenizer(prefix, truncation=True, max_length=block_size, padding=False)
-                    teacher_text_tokenized = teacher_tokenizer(text, truncation=True, max_length=block_size, padding=padding)
+                    teacher_text_tokenized = teacher_tokenizer(tea_text, truncation=True, max_length=block_size, padding=padding)
                     teacher_labels = copy.deepcopy(teacher_text_tokenized["input_ids"])
             
                     teacher_prefix_lengths = [len(p) for p in teacher_prefix_tokenized["input_ids"]]
